@@ -1,46 +1,11 @@
-// mhrv-rs exit node — deploy as an HTTP endpoint on any serverless
-// TypeScript host with a public IP that isn't a Google datacenter
-// (Deno Deploy, fly.io, your own VPS, etc.). Uses only web-standard
-// `Request` / `Response` / `fetch` so it's portable across runtimes.
+// mhrv-rs exit node for Deno Deploy
 //
-// Purpose: chain client → Apps Script → this exit node → destination.
-// Apps Script's UrlFetchApp can't reach Cloudflare-protected sites that
-// flag Google datacenter IPs as bots (chatgpt.com, claude.ai, grok.com,
-// many other CF-fronted SaaS). This exit node sits between Apps Script
-// and the destination; the destination sees the exit node's outbound IP
-// (generally not flagged as Google datacenter) and accepts the request.
-//
-// Setup:
-//   1. Pick a host that runs web-standard fetch handlers (e.g. Deno
-//      Deploy, fly.io with a thin server wrapper, or any cheap VPS
-//      running Deno / Node + this script as a handler).
-//   2. Paste the contents of this file as the request handler.
-//   3. Set PSK below to a strong secret (`openssl rand -hex 32` from
-//      a terminal — DO NOT leave the placeholder in production).
-//   4. Deploy and copy the public URL of the deployed handler.
-//   5. In mhrv-rs config.json, add:
-//        "exit_node": {
-//          "enabled": true,
-//          "relay_url": "https://your-deployed-exit-node.example.com",
-//          "psk": "<the same PSK you set above>",
-//          "mode": "selective",
-//          "hosts": ["chatgpt.com", "claude.ai", "x.com", "grok.com"]
-//        }
-//
-// Threat model: PSK is the only thing keeping this from being an open
-// proxy on the public internet. Treat it like a password: do not commit
-// to source control, do not share publicly, rotate if leaked. The exit
-// node refuses all requests that don't carry the matching PSK.
-//
-// Failure mode: if the exit node is unreachable, mhrv-rs falls back to
-// the regular Apps Script relay automatically — the only consequence
-// of an offline exit node is that ChatGPT/Claude/Grok stop working;
-// other sites are unaffected.
+// Deploy this repository on Deno Deploy using exit_node.ts as the entrypoint.
+// Set an environment variable named PSK in Deno Deploy, then use the same
+// value in your local mhrv-rs config.json exit_node.psk field.
 
-const PSK = "99da67bf0e05c1542b754ce52db3534da9604ad22d5d1bbd8137458e74ad7b74";
+const PSK = Deno.env.get("PSK") ?? "";
 
-// Headers the client may send that must NOT be forwarded to the
-// destination — they're hop-by-hop or would break re-encoding.
 const STRIP_HEADERS = new Set([
   "host",
   "connection",
@@ -81,16 +46,10 @@ function sanitizeHeaders(h: unknown): Record<string, string> {
   return out;
 }
 
-export default async function (req: Request): Promise<Response> {
-  // Fail closed on the placeholder PSK so a fresh deploy without setup
-  // can't accidentally serve as an open relay.
-  if (PSK === "CHANGE_ME_TO_A_STRONG_SECRET") {
+async function handler(req: Request): Promise<Response> {
+  if (!PSK) {
     return Response.json(
-      {
-        e:
-          "exit_node misconfigured: PSK is still the placeholder. Set " +
-          "a strong secret in the source before deploying.",
-      },
+      { e: "exit_node misconfigured: Deno Deploy environment variable PSK is not set" },
       { status: 503 },
     );
   }
@@ -114,24 +73,19 @@ export default async function (req: Request): Promise<Response> {
     if (k !== PSK) {
       return Response.json({ e: "unauthorized" }, { status: 401 });
     }
+
     if (!/^https?:\/\//i.test(u)) {
       return Response.json({ e: "bad url" }, { status: 400 });
     }
 
-    // Loop guard: if u points at this exit node's own host, refuse.
-    // Without this, a misconfigured client could chain exit-node →
-    // exit-node → exit-node → ... and burn the host's runtime budget.
     try {
       const reqUrl = new URL(req.url);
       const dstUrl = new URL(u);
-      if (
-        reqUrl.host === dstUrl.host &&
-        reqUrl.protocol === dstUrl.protocol
-      ) {
+      if (reqUrl.host === dstUrl.host && reqUrl.protocol === dstUrl.protocol) {
         return Response.json({ e: "exit-node loop refused" }, { status: 400 });
       }
     } catch {
-      // Malformed URL — let the fetch below 400.
+      // Malformed URL: let fetch handle it below.
     }
 
     let payload: Uint8Array | undefined;
@@ -162,3 +116,5 @@ export default async function (req: Request): Promise<Response> {
     return Response.json({ e: message }, { status: 500 });
   }
 }
+
+Deno.serve(handler);
